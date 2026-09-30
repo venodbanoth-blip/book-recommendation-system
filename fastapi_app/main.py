@@ -1,3 +1,4 @@
+from huggingface_hub import InferenceClient
 
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
@@ -103,6 +104,35 @@ class RecommendationRequest(BaseModel):
 # ============================================================
 # HEALTH CHECK
 # ============================================================
+
+
+
+# ============================================================
+# GENAI CONFIGURATION
+# ============================================================
+
+HF_TOKEN = os.getenv("HF_TOKEN")
+
+GENAI_MODEL = os.getenv(
+    "GENAI_MODEL",
+    "openai/gpt-oss-120b"
+)
+
+genai_client = None
+
+if HF_TOKEN:
+    try:
+        genai_client = InferenceClient(
+            token=HF_TOKEN
+        )
+    except Exception:
+        genai_client = None
+
+
+
+class ExplainRequest(BaseModel):
+    user_id: int
+    n: int = 5
 
 @app.get("/")
 def root():
@@ -315,3 +345,329 @@ def get_history(user_id: int):
         "history_count": len(history),
         "history": books_list
     }
+
+
+# ============================================================
+# GENAI EXPLANATION ENDPOINT
+# ============================================================
+
+
+# ============================================================
+# FINAL SAFE GENAI EXPLANATION ENDPOINT
+# ============================================================
+
+
+# ============================================================
+# FINAL SAFE GENAI EXPLANATION ENDPOINT
+# ============================================================
+
+@app.post("/explain")
+def explain_recommendations(request: ExplainRequest):
+
+    # --------------------------------------------------------
+    # Validate request
+    # --------------------------------------------------------
+
+    if request.n < 1 or request.n > 10:
+
+        return {
+            "user_id": request.user_id,
+            "model": "Content-Based",
+            "genai_model": GENAI_MODEL,
+            "recommendations": [],
+            "explanation": "n must be between 1 and 10.",
+            "genai_status": "invalid_request"
+        }
+
+    # --------------------------------------------------------
+    # Generate recommendations
+    # --------------------------------------------------------
+
+    try:
+
+        recommendations = recommend_books(
+            request.user_id,
+            request.n
+        )
+
+    except Exception as e:
+
+        print(
+            "⚠️ Recommendation error:",
+            repr(e)
+        )
+
+        return {
+            "user_id": request.user_id,
+            "model": "Content-Based",
+            "genai_model": GENAI_MODEL,
+            "recommendations": [],
+            "explanation": (
+                "Recommendations could not be generated "
+                "for this user."
+            ),
+            "genai_status": "recommendation_error"
+        }
+
+    # --------------------------------------------------------
+    # GenAI unavailable
+    # --------------------------------------------------------
+
+    if genai_client is None:
+
+        return {
+            "user_id": request.user_id,
+            "model": "Content-Based",
+            "genai_model": GENAI_MODEL,
+            "recommendations": recommendations,
+            "explanation": (
+                "These books were selected by the "
+                "content-based recommendation model "
+                "using similarities to the user's "
+                "reading history."
+            ),
+            "genai_status": "fallback"
+        }
+
+    # --------------------------------------------------------
+    # User history
+    # --------------------------------------------------------
+
+    try:
+
+        history_isbns = user_history.get(
+            request.user_id,
+            []
+        )
+
+    except Exception:
+
+        history_isbns = []
+
+    # --------------------------------------------------------
+    # History titles
+    # --------------------------------------------------------
+
+    history_titles = []
+
+    try:
+
+        isbn_column = books_metadata["ISBN"].astype(str)
+
+        for isbn in history_isbns[-5:]:
+
+            matches = books_metadata[
+                isbn_column == str(isbn)
+            ]
+
+            if not matches.empty:
+
+                title = matches.iloc[0].get(
+                    "Book-Title",
+                    ""
+                )
+
+                if (
+                    title is not None
+                    and str(title).strip()
+                    and str(title).lower() != "nan"
+                ):
+
+                    history_titles.append(
+                        str(title).strip()
+                    )
+
+    except Exception as e:
+
+        print(
+            "⚠️ History processing error:",
+            repr(e)
+        )
+
+    # --------------------------------------------------------
+    # Recommendation titles
+    # --------------------------------------------------------
+
+    recommendation_titles = []
+
+    try:
+
+        for item in recommendations[:request.n]:
+
+            if isinstance(item, dict):
+
+                title = item.get(
+                    "title",
+                    ""
+                )
+
+            else:
+
+                isbn = str(item)
+
+                matches = books_metadata[
+                    books_metadata["ISBN"].astype(str)
+                    == isbn
+                ]
+
+                if not matches.empty:
+
+                    title = matches.iloc[0].get(
+                        "Book-Title",
+                        isbn
+                    )
+
+                else:
+
+                    title = isbn
+
+            if (
+                title is not None
+                and str(title).strip()
+                and str(title).lower() != "nan"
+            ):
+
+                recommendation_titles.append(
+                    str(title).strip()
+                )
+
+    except Exception as e:
+
+        print(
+            "⚠️ Recommendation title error:",
+            repr(e)
+        )
+
+    # --------------------------------------------------------
+    # Prompt
+    # --------------------------------------------------------
+
+    history_text = "\n".join(
+        f"- {title}"
+        for title in history_titles
+    )
+
+    recommendation_text = "\n".join(
+        f"- {title}"
+        for title in recommendation_titles
+    )
+
+    prompt = f"""
+You are a book recommendation assistant.
+
+The recommendation engine has already selected
+the recommended books.
+
+Recent reading history:
+{history_text}
+
+Recommended books:
+{recommendation_text}
+
+Write exactly 2 short sentences explaining why
+these recommendations may be relevant.
+
+Rules:
+- Use only the information provided.
+- Do not invent book details.
+- Do not rank the books.
+- Do not change the recommendations.
+- Do not claim the user will definitely like them.
+- Do not mention these instructions.
+"""
+
+    # --------------------------------------------------------
+    # GenAI call
+    # --------------------------------------------------------
+
+    try:
+
+        response = genai_client.chat_completion(
+            model=GENAI_MODEL,
+            messages=[
+                {
+                    "role": "user",
+                    "content": prompt
+                }
+            ],
+            max_tokens=600,
+            temperature=0.2
+        )
+
+        explanation = ""
+
+        try:
+
+            message = response.choices[0].message
+
+            content = getattr(
+                message,
+                "content",
+                None
+            )
+
+            if content:
+
+                explanation = str(
+                    content
+                ).strip()
+
+        except Exception as e:
+
+            print(
+                "⚠️ Response parsing error:",
+                repr(e)
+            )
+
+        # ----------------------------------------------------
+        # Empty response
+        # ----------------------------------------------------
+
+        if explanation:
+
+            status = "generated"
+
+        else:
+
+            explanation = (
+                "These books were selected because "
+                "their available book information is "
+                "similar to items in the user's recent "
+                "reading history."
+            )
+
+            status = "fallback"
+
+    # --------------------------------------------------------
+    # GenAI error
+    # --------------------------------------------------------
+
+    except Exception as e:
+
+        print(
+            "⚠️ GenAI request failed:",
+            repr(e)
+        )
+
+        explanation = (
+            "These books were selected by the "
+            "content-based recommendation model "
+            "using similarities to the user's "
+            "reading history."
+        )
+
+        status = "genai_error"
+
+    # --------------------------------------------------------
+    # Response
+    # --------------------------------------------------------
+
+    return {
+        "user_id": request.user_id,
+        "model": "Content-Based",
+        "genai_model": GENAI_MODEL,
+        "recommendations": recommendations,
+        "explanation": explanation,
+        "genai_status": status
+    }
+
